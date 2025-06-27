@@ -5,14 +5,37 @@ A super simple FastAPI application that allows students to view and sign up
 for extracurricular activities at Mergington High School.
 """
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request, Response, Depends, Cookie
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import RedirectResponse
+from fastapi.responses import RedirectResponse, JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
 import os
 from pathlib import Path
+import secrets
+from typing import List
+from fastapi import Security
 
 app = FastAPI(title="Mergington High School API",
               description="API for viewing and signing up for extracurricular activities")
+
+# Allow CORS for frontend JS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# In-memory user database (for demo only)
+users = {
+    "admin@mergington.edu": {"password": "adminpass", "role": "admin", "name": "Admin User"},
+    "teacher@mergington.edu": {"password": "teachpass", "role": "staff", "name": "Teacher T."},
+    "student@mergington.edu": {"password": "studpass", "role": "student", "name": "Student S."},
+}
+
+# In-memory session store: session_token -> user_email
+sessions = {}
 
 # Mount the static files directory
 current_dir = Path(__file__).parent
@@ -88,45 +111,111 @@ def get_activities():
     return activities
 
 
+# Dependency to get current user from session cookie
+def get_current_user(session_token: str = Cookie(None)):
+    if not session_token or session_token not in sessions:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    email = sessions[session_token]
+    user = users.get(email)
+    if not user:
+        raise HTTPException(status_code=401, detail="Invalid session")
+    return {"email": email, **user}
+
+
+@app.post("/login")
+def login(data: dict, response: Response):
+    email = data.get("email")
+    password = data.get("password")
+    user = users.get(email)
+    if not user or user["password"] != password:
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+    # Create session
+    session_token = secrets.token_urlsafe(16)
+    sessions[session_token] = email
+    response.set_cookie(key="session_token", value=session_token, httponly=True)
+    return {"message": "Login successful", "role": user["role"], "name": user["name"]}
+
+
+@app.post("/logout")
+def logout(response: Response, session_token: str = Cookie(None)):
+    if session_token in sessions:
+        del sessions[session_token]
+    response.delete_cookie("session_token")
+    return {"message": "Logged out"}
+
+
+@app.get("/me")
+def get_me(user=Depends(get_current_user)):
+    return {"email": user["email"], "role": user["role"], "name": user["name"]}
+
+
 @app.post("/activities/{activity_name}/signup")
-def signup_for_activity(activity_name: str, email: str):
-    """Sign up a student for an activity"""
-    # Validate activity exists
+def signup_for_activity(activity_name: str, email: str, user=Depends(get_current_user)):
+    """Sign up a student for an activity. Only staff or the student themselves can sign up."""
     if activity_name not in activities:
         raise HTTPException(status_code=404, detail="Activity not found")
-
-    # Get the specific activity
     activity = activities[activity_name]
-
-    # Validate student is not already signed up
+    # Only staff or the student themselves can sign up
+    if user["role"] == "student" and user["email"] != email:
+        raise HTTPException(status_code=403, detail="Students can only sign up themselves")
     if email in activity["participants"]:
-        raise HTTPException(
-            status_code=400,
-            detail="Student is already signed up"
-        )
-
-    # Add student
+        raise HTTPException(status_code=400, detail="Student is already signed up")
     activity["participants"].append(email)
     return {"message": f"Signed up {email} for {activity_name}"}
 
 
 @app.delete("/activities/{activity_name}/unregister")
-def unregister_from_activity(activity_name: str, email: str):
-    """Unregister a student from an activity"""
-    # Validate activity exists
+def unregister_from_activity(activity_name: str, email: str, user=Depends(get_current_user)):
+    """Unregister a student from an activity. Only staff or the student themselves can unregister."""
     if activity_name not in activities:
         raise HTTPException(status_code=404, detail="Activity not found")
-
-    # Get the specific activity
     activity = activities[activity_name]
-
-    # Validate student is signed up
+    if user["role"] == "student" and user["email"] != email:
+        raise HTTPException(status_code=403, detail="Students can only unregister themselves")
     if email not in activity["participants"]:
-        raise HTTPException(
-            status_code=400,
-            detail="Student is not signed up for this activity"
-        )
-
-    # Remove student
+        raise HTTPException(status_code=400, detail="Student is not signed up for this activity")
     activity["participants"].remove(email)
     return {"message": f"Unregistered {email} from {activity_name}"}
+
+
+# Utility: role-based dependency
+def require_roles(roles: List[str]):
+    def role_checker(user=Depends(get_current_user)):
+        if user["role"] not in roles:
+            raise HTTPException(status_code=403, detail="Insufficient permissions")
+        return user
+    return role_checker
+
+
+@app.post("/users/create")
+def create_user(data: dict, user=Depends(require_roles(["admin", "staff"]))):
+    """Create a new user (admin or staff only)."""
+    email = data.get("email")
+    password = data.get("password")
+    role = data.get("role")
+    name = data.get("name")
+    if not email or not password or not role or not name:
+        raise HTTPException(status_code=400, detail="Missing user fields")
+    if email in users:
+        raise HTTPException(status_code=400, detail="User already exists")
+    if role not in ["admin", "staff", "student"]:
+        raise HTTPException(status_code=400, detail="Invalid role")
+    users[email] = {"password": password, "role": role, "name": name}
+    return {"message": f"User {email} created with role {role}"}
+
+
+@app.delete("/users/{email}")
+def delete_user(email: str, user=Depends(require_roles(["admin"]))):
+    """Delete a user (admin only)."""
+    if email not in users:
+        raise HTTPException(status_code=404, detail="User not found")
+    if users[email]["role"] == "admin":
+        raise HTTPException(status_code=403, detail="Cannot delete another admin")
+    del users[email]
+    return {"message": f"User {email} deleted"}
+
+
+@app.get("/users")
+def list_users(user=Depends(require_roles(["admin", "staff"]))):
+    """List all users (admin or staff only)."""
+    return {email: {k: v for k, v in info.items() if k != "password"} for email, info in users.items()}
